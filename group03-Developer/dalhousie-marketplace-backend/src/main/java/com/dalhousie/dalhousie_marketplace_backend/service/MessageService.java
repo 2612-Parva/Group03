@@ -3,16 +3,30 @@ package com.dalhousie.dalhousie_marketplace_backend.service;
 import com.dalhousie.dalhousie_marketplace_backend.DTO.ConversationDTO;
 import com.dalhousie.dalhousie_marketplace_backend.model.*;
 import com.dalhousie.dalhousie_marketplace_backend.repository.*;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.context.annotation.Scope;
+import org.springframework.stereotype.Component;
 
 import java.util.*;
 import java.util.stream.Collectors;
 
-@Service
-public class MessageService {
 
+interface MessageSubject {
+    void registerObserver(MessageObserver observer);
+    void removeObserver(MessageObserver observer);
+    void notifyObservers(Message message);
+}
+
+interface MessageObserver {
+    void update(Message message);
+}
+
+@Service
+@Scope("singleton")
+public class MessageService implements MessageSubject {
     @Autowired
     private MessageRepository messageRepository;
 
@@ -20,21 +34,73 @@ public class MessageService {
     private ListingRepository listingRepository;
 
     @Autowired
-    private NotificationRepository notificationRepository;
-
-    @Autowired
     private UserRepository userRepository;
 
     @Autowired
     private SimpMessagingTemplate messagingTemplate;
 
-    @Autowired
-    private NotificationService notificationService;
+    private List<MessageObserver> observers = new ArrayList<>();
 
-    /**
-     * Overloaded method for backward compatibility (Supports old method calls).
-     * This is required to fix failing tests.
-     */
+    @PostConstruct
+    public void init() {
+        registerObserver(new NotificationObserver());
+        registerObserver(new WebSocketObserver());
+    }
+
+    @Override
+    public void registerObserver(MessageObserver observer) {
+        if (!observers.contains(observer)) {
+            observers.add(observer);
+        }
+    }
+
+    @Override
+    public void removeObserver(MessageObserver observer) {
+        observers.remove(observer);
+    }
+
+    @Override
+    public void notifyObservers(Message message) {
+        for (MessageObserver observer : observers) {
+            observer.update(message);
+        }
+    }
+
+    @Component
+    public class NotificationObserver implements MessageObserver {
+        @Autowired
+        private NotificationService notificationService;
+
+        @Override
+        public void update(Message message) {
+            User receiver = message.getReceiver();
+            String content = message.getSender().getUsername() + " sent you a message: " + message.getContent();
+
+            notificationService.sendNotification(
+                    receiver,
+                    NotificationType.MESSAGE,
+                    content
+            );
+        }
+    }
+
+    @Component
+    public class WebSocketObserver implements MessageObserver {
+        @Autowired
+        private SimpMessagingTemplate messagingTemplate;
+
+        @Override
+        public void update(Message message) {
+            // Send real-time update via WebSocket
+            messagingTemplate.convertAndSendToUser(
+                    message.getReceiver().getUserId().toString(),
+                    "/queue/messages",
+                    message
+            );
+        }
+    }
+
+
     public Message sendMessage(Long senderId, Long listingId, String content) {
         Listing listing = listingRepository.findById(listingId)
                 .orElseThrow(() -> new RuntimeException("Listing not found"));
@@ -45,9 +111,7 @@ public class MessageService {
         return sendMessage(senderId, receiverId, listingId, content, conversationId);
     }
 
-    /**
-     * Sends a message between users for a listing.
-     */
+
     public Message sendMessage(Long senderId, Long receiverId, Long listingId, String content, String conversationId) {
         if (senderId.equals(receiverId)) {
             throw new RuntimeException("You cannot message yourself.");
@@ -70,14 +134,13 @@ public class MessageService {
 
         messageRepository.save(message);
 
-        notifyUserAboutNewMSG(receiverId, sender.getUsername() + " sent you a message: " + content);
+
+        notifyObservers(message);
 
         return message;
     }
 
-    /**
-     * Generates a unique and standardized conversation ID.
-     */
+
     public String generateConversationId(Long senderId, Long receiverId, Long listingId) {
         validateNotNull(senderId, "Sender ID");
         validateNotNull(receiverId, "Receiver ID");
@@ -95,30 +158,12 @@ public class MessageService {
         }
     }
 
-    /**
-     * Creates a notification for a user.
-     */
-    private void notifyUserAboutNewMSG(Long receiverId, String messageContent) {
-        User receiver = userRepository.findById(receiverId)
-                .orElseThrow(() -> new RuntimeException("Receiver not found"));
 
-        notificationService.sendNotification(
-                receiver,
-                NotificationType.MESSAGE,
-                messageContent
-        );
-    }
-
-    /**
-     * Retrieves message history for a specific conversation.
-     */
     public List<Message> getMessageHistory(String conversationId) {
         return messageRepository.findByConversationId(conversationId);
     }
 
-    /**
-     * Retrieves all conversations for a seller.
-     */
+
     public List<ConversationDTO> getSellerConversations(Long sellerId) {
         List<String> conversationIds = messageRepository.findDistinctConversationIdsBySeller(sellerId);
         return buildConversationDTOList(conversationIds, sellerId);
@@ -175,9 +220,7 @@ public class MessageService {
         );
     }
 
-    /**
-     * Retrieves all buyer-seller conversations for a specific listing.
-     */
+
     public List<ConversationDTO> getMessagesForListing(Long listingId, Long userId) {
         List<Message> messages = messageRepository.findByListingAndUser(listingId, userId);
         Map<String, Message> latestMessages = new HashMap<>();
@@ -218,9 +261,7 @@ public class MessageService {
                 .collect(Collectors.toList());
     }
 
-    /**
-     * Retrieves all conversations for a buyer.
-     */
+
     public List<ConversationDTO> getBuyerConversations(Long buyerId) {
         List<String> conversationIds = messageRepository.findDistinctConversationIdsByBuyer(buyerId);
 
