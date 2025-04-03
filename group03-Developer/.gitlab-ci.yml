@@ -1,0 +1,193 @@
+# List of stages for jobs, and their order of execution
+stages:
+  - build
+  - test
+  - quality-test
+  - publish
+  - deploy
+
+build-backend:
+  stage: build  # Assign job to the 'build' stage
+  tags:
+    - Dal-marketplace-runner # Runner used to execute this job
+  image: maven:latest # Use Maven image to build the Java backen
+  script:
+    - cd dalhousie-marketplace-backend  # Navigate to backend project
+    - mvn clean package 
+  artifacts:
+    paths:
+      - dalhousie-marketplace-backend/target/*.jar  # Store built JAR file as an artifact
+
+
+build-frontend:
+  stage: build
+  tags:
+    - Dal-marketplace-runner
+  image: node:18-alpine  # Use Node.js to build the frontend
+  script:
+    - cd dalhousie-marketplace-frontend
+    - npm i
+    - echo $BASE_URL # Print backend URL
+    - export BACKEND_BASE_URL=$BASE_URL  # Set backend URL for frontend
+    - echo $BACKEND_BASE_URL
+    - npm run build
+  artifacts:
+    paths:
+      - dalhousie-marketplace-frontend/build
+
+# test:
+#   stage: test
+#   image: maven:latest
+#   script:
+#     - cd dalhousie-marketplace-backend
+#     - mvn -B test --fail-at-end || { echo "Tests failed. Exiting!"; exit 1; }
+#   artifacts:
+#     when: always
+#     reports:
+#       junit: dalhousie-marketplace-backend/target/surefire-reports/TEST-*.xml
+
+test:
+  stage: test
+  image: maven:latest
+  script:
+    - cd dalhousie-marketplace-backend
+    - mvn clean verify -DskipTests=false -DfailIfNoTests=true || exit 1
+    - ls -lah target/surefire-reports || echo "No test reports found!"
+  artifacts:
+    when: always
+    reports:
+      junit: dalhousie-marketplace-backend/target/surefire-reports/TEST-*.xml
+
+quality-test:
+  stage: quality-test
+  image: openjdk:17
+  script:
+    - echo "Compiling the project"
+    - mkdir smells/
+    - java -jar $CI_PROJECT_DIR/Code_smells/DesigniteJava.jar -i $CI_PROJECT_DIR -o smells/ -d
+  artifacts:
+    paths:
+      - smells/
+      - $CI_PROJECT_DIR
+
+
+publish-backend:
+  image: docker:latest
+  stage: publish
+  tags:
+    - Dal-marketplace-runner # Use Docker image to containerize the application
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: "tcp://docker:2375" # Docker daemon host
+  services:
+    - docker:dind
+  script:
+    - cd dalhousie-marketplace-backend
+    - pwd
+    - ls
+    - echo $SERVER_IP
+    - docker --version
+    - docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_PWD docker.io # Authenticate with Docker Hub
+    - IMAGE_TAG="$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA" # Create image tag using commit info
+    - docker build -t kritipatel013/dalhousie-marketplace-backend-api:$IMAGE_TAG . -f Dockerfile
+    - docker push kritipatel013/dalhousie-marketplace-backend-api:$IMAGE_TAG
+  only:
+    - ISSUE22_CICD
+    - Developer
+    - main
+
+
+publish-frontend:
+  image: docker:latest
+  stage: publish
+  tags:
+   - Dal-marketplace-runner
+  # - autoscale-runner.cs.dal.ca
+  variables:
+   # these values may need to be different if using TLS, k8s, etc.
+   # You can alternatively set defaults in your runner config
+   DOCKER_TLS_CERTDIR: ""
+   DOCKER_HOST: "tcp://docker:2375"
+  services:
+   - docker:dind
+  script:
+   - cd dalhousie-marketplace-frontend
+   - pwd
+   - ls
+   - echo $SERVER_IP
+   - docker --version
+   - docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_PWD docker.io
+   - IMAGE_TAG="$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+   - docker build --build-arg BACKEND_BASE_URL=$BASE_URL -t kritipatel013/dalhousie-marketplace-frontend:$IMAGE_TAG . -f Dockerfile
+   - docker push kritipatel013/dalhousie-marketplace-frontend:$IMAGE_TAG
+  only:
+    - ISSUE22_CICD
+    - Developer
+    - main
+
+deploy-backend:
+  image: alpine:latest # Using lightweight Alpine Linux image
+  stage: deploy
+  tags:
+    - Dal-marketplace-runner
+  before_script:
+    - apk update && apk add openssh-client
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$ID_RSA" | base64 -d > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-add ~/.ssh/id_ed25519
+  script:
+    - CONTAINER_NAME=""
+    - SERVER_PORT=""
+    - DB_URL=""
+    - DB_USER=""
+    - DB_PASSWORD=""
+    - IMAGE_TAG="$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    - if [ "$CI_COMMIT_REF_NAME" == "Developer" ]; then CONTAINER_NAME="dal-marketplace-dev-app"; SERVER_PORT=8080; DB_URL=$DEVINT_DB_URL; DB_USER=$DEVINT_DB_USER; DB_PASSWORD=$DEVINT_DB_PASSWORD; fi
+    - if [ "$CI_COMMIT_REF_NAME" == "main" ]; then CONTAINER_NAME="dal-marketplace-prod-app"; SERVER_PORT=8073; DB_URL=$PROD_DB_URL; DB_USER=$PROD_DB_USER; DB_PASSWORD=$PROD_DB_PASSWORD; fi
+    - if [ "$CI_COMMIT_REF_NAME" != "main" ] && [ "$CI_COMMIT_REF_NAME" != "Developer" ]; then CONTAINER_NAME="dal-marketplace-test-app"; SERVER_PORT=8000; DB_URL=$TEST_DB_URL; DB_USER=$TEST_DB_USER; DB_PASSWORD=$TEST_DB_PASSWORD; fi
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_PWD docker.io"
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull kritipatel013/dalhousie-marketplace-backend-api:$IMAGE_TAG"
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker stop $CONTAINER_NAME || true && docker container rm -f $CONTAINER_NAME || true"
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker run -d -p $SERVER_PORT:$SERVER_PORT --name $CONTAINER_NAME --restart=always -e SERVER_PORT=$SERVER_PORT -e SPRING_DATASOURCE_URL=$DB_URL -e SPRING_DATASOURCE_USERNAME=$DB_USER -e SPRING_DATASOURCE_PASSWORD=$DB_PASSWORD -e EMAIL_HOST=$EMAIL_HOST -e EMAIL_PORT=$EMAIL_PORT -e EMAIL_USERNAME=$EMAIL_USERNAME -e EMAIL_PASSWORD=$EMAIL_PASSWORD -e FRONTEND_HOST=$FRONTEND_HOST -e FRONTEND_LOGIN_URL=$FRONTEND_LOGIN_URL -e FRONTEND_UPDATE_PASSWORD_URL=$FRONTEND_UPDATE_PASSWORD_URL kritipatel013/dalhousie-marketplace-backend-api:$IMAGE_TAG"
+  environment:
+    name: development
+    url: http://$SERVER_IP:$SERVER_PORT
+  only:
+    - ISSUE22_CICD
+    - Developer
+    - main
+
+deploy-frontend:
+  image: alpine:latest
+  stage: deploy
+  tags:
+   - Dal-marketplace-runner
+  before_script:
+    - apk update && apk add openssh-client
+    - eval $(ssh-agent -s)
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$ID_RSA" | base64 -d > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-add ~/.ssh/id_ed25519
+  script:
+    - CONTAINER_NAME=""
+    - SERVER_PORT=""
+    - IMAGE_TAG="$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    - if [ "$CI_COMMIT_REF_NAME" == "Developer" ]; then CONTAINER_NAME="dal-marketplace-dev-app-frontend"; SERVER_PORT=3000; REACT_APP_BACKEND_BASE_URL=$DEV_BACKEND_BASE_URL;fi
+    - if [ "$CI_COMMIT_REF_NAME" == "main" ]; then CONTAINER_NAME="dal-marketplace-prod-app-frontend"; SERVER_PORT=3080; REACT_APP_BACKEND_BASE_URL=$PROD_BACKEND_BASE_URL;fi
+    - if [ "$CI_COMMIT_REF_NAME" != "main" ] && [ "$CI_COMMIT_REF_NAME" != "Developer" ]; then CONTAINER_NAME="dal-marketplace-test-app-frontend"; SERVER_PORT=3030; REACT_APP_BACKEND_BASE_URL=$TEST_BACKEND_BASE_URL;fi
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_PWD docker.io"
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker pull kritipatel013/dalhousie-marketplace-frontend:$IMAGE_TAG"
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker container rm -f $CONTAINER_NAME || true"
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no $SERVER_USER@$SERVER_IP "docker run -d -p $SERVER_PORT:$SERVER_PORT -e PORT=$SERVER_PORT -e REACT_APP_BACKEND_BASE_URL=$REACT_APP_BACKEND_BASE_URL --name $CONTAINER_NAME --restart=always kritipatel013/dalhousie-marketplace-frontend:$IMAGE_TAG"
+  environment:
+    name: development
+    url: http://$SERVER_IP:$SERVER_PORT
+  only:
+    - ISSUE22_CICD
+    - Developer
+    - main
